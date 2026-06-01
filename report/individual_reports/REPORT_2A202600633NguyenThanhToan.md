@@ -2,7 +2,7 @@
 
 - **Student Name**: Nguyễn Thanh Toàn
 - **Student ID**: 2A202600633
-- **Date**: 02/06/2026
+- **Date**: 01/06/2026
 
 ---
 
