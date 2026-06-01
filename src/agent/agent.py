@@ -34,15 +34,39 @@ class ReActAgent:
     2. Anthropic Agent Skills dynamic filesystem progressive disclosure architecture.
     """
 
-    def __init__(self, llm: LLMProvider, tools: Optional[List[Dict[str, Any]]] = None, max_steps: int = 8):
+    def __init__(
+        self,
+        llm: LLMProvider,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        max_steps: int = 8,
+        persist_history: bool = True
+    ):
         self.llm = llm
         self.tools = tools or []
         self.max_steps = max_steps
+        self.persist_history = persist_history
         self.history = []
+        self.conversation_history: List[Dict[str, str]] = []
         self.skills_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 
             "skills"
         )
+
+    def _build_conversation_preamble(self) -> str:
+        if not self.conversation_history:
+            return ""
+        lines = ["Conversation History:"]
+        for msg in self.conversation_history:
+            role = "User" if msg.get("role") == "user" else "Assistant"
+            lines.append(f"{role}: {msg.get('content', '')}")
+        lines.append("")
+        return "\n".join(lines)
+
+    def _store_conversation_turn(self, user_input: str, response: str) -> str:
+        if self.persist_history:
+            self.conversation_history.append({"role": "user", "content": user_input})
+            self.conversation_history.append({"role": "assistant", "content": response})
+        return response
 
     def parse_frontmatter(self, content: str) -> Dict[str, str]:
         """
@@ -225,7 +249,8 @@ class ReActAgent:
         print(f"\n🤖 [AGENT] Starting ReAct reasoning loop for query: '{user_input}'...")
         
         # Initialize conversation history
-        history_str = f"Question: {user_input}\n"
+        history_str = self._build_conversation_preamble()
+        history_str += f"Question: {user_input}\n"
         self.history = [
             {"role": "user", "content": user_input}
         ]
@@ -279,7 +304,7 @@ class ReActAgent:
                 if final_match and "Action:" not in content:
                     final_answer = final_match.group(1).strip()
                     logger.log_event("AGENT_END", {"steps": steps, "status": "completed"})
-                    return final_answer
+                    return self._store_conversation_turn(user_input, final_answer)
                 
                 # 3. Parse Action (Tool Call)
                 parsed = self.parse_action(content)
@@ -288,7 +313,7 @@ class ReActAgent:
                     if final_match:
                         final_answer = final_match.group(1).strip()
                         logger.log_event("AGENT_END", {"steps": steps, "status": "completed"})
-                        return final_answer
+                        return self._store_conversation_turn(user_input, final_answer)
                         
                     warning_msg = "Error: You did not output a Final Answer or call a valid Action format (e.g. Action: tool_name(arguments)). Please check formatting rules."
                     print(f"⚠️ [PARSER ERROR] {warning_msg}")
@@ -315,17 +340,72 @@ class ReActAgent:
                 error_msg = f"System error during ReAct loop: {str(e)}"
                 print(f"🚨 [SYSTEM ERROR] {error_msg}")
                 logger.log_event("AGENT_ERROR", {"error": str(e)})
-                return error_msg
+                return self._store_conversation_turn(user_input, error_msg)
                 
         timeout_msg = "Failed to reach a Final Answer within the maximum steps limit."
         logger.log_event("AGENT_END", {"steps": steps, "status": "timeout"})
-        
+
+        if self.max_steps > 3:
+            limit_prompt = (
+                "Observation: You have reached the maximum number of reasoning steps "
+                f"({self.max_steps}). You must provide a Final Answer now and explicitly "
+                "state that the limit was reached."
+            )
+            self.history.append({"role": "user", "content": limit_prompt})
+            history_str += f"{limit_prompt}\n"
+
+            try:
+                response = self.llm.generate(history_str, system_prompt=self.get_system_prompt())
+
+                if isinstance(response, dict):
+                    content = response.get("content", "").strip()
+                    usage = response.get("usage", {})
+                    latency_ms = response.get("latency_ms", 0)
+                    provider = response.get("provider", "")
+                else:
+                    content = str(response).strip()
+                    usage = {
+                        "prompt_tokens": len(history_str) // 4,
+                        "completion_tokens": len(content) // 4,
+                        "total_tokens": (len(history_str) + len(content)) // 4
+                    }
+                    latency_ms = 0
+                    provider = "mimo"
+
+                from src.telemetry.metrics import tracker
+                tracker.track_request(
+                    provider=provider,
+                    model=self.llm.model_name,
+                    usage=usage,
+                    latency_ms=latency_ms
+                )
+
+                self.history.append({"role": "assistant", "content": content})
+                history_str += content + "\n"
+
+                final_match = re.search(r"Final\s*Answer\s*:\s*(.*)", content, re.DOTALL | re.IGNORECASE)
+                if final_match:
+                    final_answer = final_match.group(1).strip()
+                    logger.log_event("AGENT_END", {"steps": steps, "status": "forced_completion"})
+                    return self._store_conversation_turn(user_input, final_answer)
+
+                forced_reply = f"{timeout_msg} Limit reached ({self.max_steps}). {content}"
+                logger.log_event("AGENT_END", {"steps": steps, "status": "forced_completion"})
+                return self._store_conversation_turn(user_input, forced_reply)
+            except Exception as e:
+                error_msg = (
+                    f"{timeout_msg} Limit reached ({self.max_steps}). "
+                    f"System error during final forced response: {str(e)}"
+                )
+                logger.log_event("AGENT_ERROR", {"error": str(e)})
+                return self._store_conversation_turn(user_input, error_msg)
+
         # Attempt to rescue the run by extracting any final answer found in history
         rescue_match = re.search(r"Final\s*Answer\s*:\s*(.*)", history_str, re.DOTALL | re.IGNORECASE)
         if rescue_match:
-            return rescue_match.group(1).strip()
-            
-        return timeout_msg
+            return self._store_conversation_turn(user_input, rescue_match.group(1).strip())
+
+        return self._store_conversation_turn(user_input, timeout_msg)
 
     def _execute_tool(self, tool_name: str, args: Any) -> Any:
         """
